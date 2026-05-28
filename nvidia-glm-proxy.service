@@ -1,0 +1,17 @@
+[Unit]
+Description=NVIDIA GLM Proxy (fixes GLM-5.1 tool_call IDs)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/node %h/nvidia-glm-proxy/proxy.js
+Restart=always
+RestartSec=3
+EnvironmentFile=%h/nvidia-glm-proxy/.env
+Environment=NODE_ENV=production
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target
