@@ -91,13 +91,16 @@ if (-not (Test-Path $logsDir)) {
 # 5. Start proxy with pm2
 Write-Step "5/6 Starting nvidia-glm-proxy with pm2"
 Push-Location $ScriptDir
-pm2 delete nvidia-glm-proxy 2>$null
+pm2 delete nvidia-glm-proxy 2>&1 | Out-Null
+$ErrorActionPreference = "Continue"
 pm2 start ecosystem.config.js
 if ($LASTEXITCODE -ne 0) {
     Write-Host "ERROR: Failed to start proxy with pm2" -ForegroundColor Red
+    $ErrorActionPreference = "Stop"
     Pop-Location
     exit 1
 }
+$ErrorActionPreference = "Stop"
 pm2 save
 Pop-Location
 
