@@ -13,9 +13,14 @@ $pm2Available = Get-Command pm2 -ErrorAction SilentlyContinue
 
 if ($pm2Available) {
     Write-Host "Stopping nvidia-glm-proxy via pm2..." -ForegroundColor Yellow
-    pm2 delete nvidia-glm-proxy 2>$null
-    pm2 save
-    Write-Host "Proxy stopped and removed from pm2." -ForegroundColor Green
+    $existing = pm2 jlist 2>$null | ConvertFrom-Json 2>$null | Where-Object { $_.name -eq "nvidia-glm-proxy" } 2>$null
+    if ($existing) {
+        pm2 delete nvidia-glm-proxy 2>$null
+        pm2 save
+        Write-Host "Proxy stopped and removed from pm2." -ForegroundColor Green
+    } else {
+        Write-Host "Proxy not found in pm2 (already stopped)." -ForegroundColor Yellow
+    }
 } else {
     Write-Host "pm2 not found. Attempting to kill any running proxy process..." -ForegroundColor Yellow
     $procs = Get-Process -Name node -ErrorAction SilentlyContinue | Where-Object {
