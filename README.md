@@ -172,6 +172,10 @@ When GLM-5.1 omits `function.name` from a tool call, the proxy tries to infer it
 
 ## Changelog
 
+### v1.0.3
+
+- **Fix Windows install.ps1 crash**: `pm2 delete` no longer crashes on first install — checks if process exists before deleting
+
 ### v1.0.1
 
 - **Fix 401 Unauthorized**: always replace client `Authorization` header with real NVIDIA API key from `.env`, preventing auth errors when clients send dummy keys like `sk-proxy`

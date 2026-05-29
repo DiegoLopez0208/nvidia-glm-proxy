@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.0.3] - 2025-05-29
+
+### Fixed
+
+- **Windows `install.ps1` pm2 crash on first install**: `pm2 delete` throws a terminating error in PowerShell when the process doesn't exist yet (first install). Now checks with `pm2 jlist` before calling `pm2 delete`.
+- **Windows `uninstall.ps1` pm2 crash**: Same fix — checks if process exists in pm2 before attempting delete.
+
 ## [1.0.1] - 2025-05-29
 
 ### Fixed
