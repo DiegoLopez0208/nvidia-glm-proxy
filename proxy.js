@@ -4,7 +4,7 @@
 var fs = require("fs");
 var path = require("path");
 var http = require("http");
-var https = require("https");
+var http2 = require("http2");
 var crypto = require("crypto");
 
 function loadEnv() {
@@ -358,14 +358,21 @@ function buildProxyHeaders(incomingHeaders) {
   out["host"] = TARGET_HOST;
 
   if (DEFAULT_API_KEY) {
-    var hasAuth = false;
+    var authKey = null;
     for (var k in out) {
       if (k.toLowerCase() === "authorization") {
-        hasAuth = true;
+        authKey = k;
         break;
       }
     }
-    if (!hasAuth) {
+    if (authKey !== null) {
+      var oldVal = out[authKey];
+      if (oldVal !== "Bearer " + DEFAULT_API_KEY) {
+        delete out[authKey];
+        out["authorization"] = "Bearer " + DEFAULT_API_KEY;
+        console.error("[AUTH] replaced client Authorization header with default API key");
+      }
+    } else {
       out["authorization"] = "Bearer " + DEFAULT_API_KEY;
       console.error("[AUTH] injected default API key from env");
     }
@@ -387,6 +394,50 @@ function handleHealthCheck(req, res) {
   );
 }
 
+var h2Session = null;
+var h2SessionBusy = false;
+var h2SessionQueue = [];
+
+function getH2Session(cb) {
+  if (h2Session && !h2Session.destroyed && !h2Session.closed) {
+    cb(null, h2Session);
+    return;
+  }
+  h2SessionQueue.push(cb);
+  if (h2SessionBusy) return;
+  h2SessionBusy = true;
+  var session = http2.connect("https://" + TARGET_HOST, {
+    peerMaxConcurrentStreams: 100,
+  });
+  session.on("error", function (err) {
+    console.error("[H2] session error: " + err.message);
+    h2Session = null;
+    h2SessionBusy = false;
+    var queued = h2SessionQueue.splice(0);
+    for (var i = 0; i < queued.length; i++) {
+      queued[i](err, null);
+    }
+  });
+  session.on("goaway", function () {
+    console.error("[H2] goaway received, closing session");
+    if (h2Session === session) h2Session = null;
+    session.close();
+  });
+  session.on("close", function () {
+    if (h2Session === session) h2Session = null;
+    h2SessionBusy = false;
+  });
+  session.on("connect", function () {
+    console.error("[H2] session established to " + TARGET_HOST);
+    h2Session = session;
+    h2SessionBusy = false;
+    var queued = h2SessionQueue.splice(0);
+    for (var i = 0; i < queued.length; i++) {
+      queued[i](null, session);
+    }
+  });
+}
+
 function handleProxyRequest(req, res, bodyBuf) {
   var ctx = extractRequestContext(bodyBuf);
   var toolLookup = buildToolLookup(ctx.tools);
@@ -394,34 +445,67 @@ function handleProxyRequest(req, res, bodyBuf) {
   var toolChoice = ctx.toolChoice;
 
   var proxyHeaders = buildProxyHeaders(req.headers);
+  delete proxyHeaders["connection"];
+  delete proxyHeaders["transfer-encoding"];
+  proxyHeaders[http2.constants.HTTP2_HEADER_PATH] = req.url;
+  proxyHeaders[http2.constants.HTTP2_HEADER_METHOD] = req.method;
+  proxyHeaders[http2.constants.HTTP2_HEADER_AUTHORITY] = TARGET_HOST;
   proxyHeaders["content-length"] = bodyBuf.length;
 
-  var proxyReq = https.request(
-    {
-      hostname: TARGET_HOST,
-      port: TARGET_PORT,
-      path: req.url,
-      method: req.method,
-      headers: proxyHeaders,
-      timeout: UPSTREAM_TIMEOUT,
-    },
-    function (proxyRes) {
-      var contentType = (proxyRes.headers["content-type"] || "").toLowerCase();
+  var timeoutId = setTimeout(function () {
+    console.error("[ERROR] upstream timeout (" + UPSTREAM_TIMEOUT / 1000 + "s)");
+    if (stream && !stream.destroyed) stream.destroy(new Error("upstream timeout"));
+    if (!res.headersSent) {
+      res.writeHead(504, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Gateway Timeout", message: "upstream timeout" }));
+    }
+  }, UPSTREAM_TIMEOUT);
+
+  var stream = null;
+
+  getH2Session(function (err, session) {
+    if (err || !session) {
+      clearTimeout(timeoutId);
+      console.error("[ERROR] h2 session unavailable: " + (err ? err.message : "null"));
+      if (!res.headersSent) {
+        res.writeHead(502, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "Bad Gateway", message: err ? err.message : "h2 session unavailable" }));
+      }
+      return;
+    }
+
+    try {
+      stream = session.request(proxyHeaders);
+    } catch (e) {
+      clearTimeout(timeoutId);
+      console.error("[ERROR] h2 request failed: " + e.message);
+      h2Session = null;
+      if (!res.headersSent) {
+        res.writeHead(502, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "Bad Gateway", message: e.message }));
+      }
+      return;
+    }
+
+    stream.on("response", function (headers) {
+      clearTimeout(timeoutId);
+      var status = headers[http2.constants.HTTP2_HEADER_STATUS] || 200;
+      var contentType = (headers["content-type"] || "").toLowerCase();
       var isStreaming = contentType.indexOf("text/event-stream") !== -1;
 
       if (isStreaming) {
         var outHeaders = {
-          "content-type": proxyRes.headers["content-type"] || "text/event-stream",
-          "cache-control": proxyRes.headers["cache-control"] || "no-cache",
-          connection: proxyRes.headers["connection"] || "keep-alive",
+          "content-type": headers["content-type"] || "text/event-stream",
+          "cache-control": headers["cache-control"] || "no-cache",
+          connection: "keep-alive",
           "x-accel-buffering": "no",
         };
-        res.writeHead(proxyRes.statusCode, outHeaders);
+        res.writeHead(status, outHeaders);
 
         var buffer = "";
         var toolCallIdMap = new Map();
 
-        proxyRes.on("data", function (chunk) {
+        stream.on("data", function (chunk) {
           buffer += chunk.toString("utf8");
           var parts = buffer.split("\n\n");
           buffer = parts.pop();
@@ -446,7 +530,7 @@ function handleProxyRequest(req, res, bodyBuf) {
           }
         });
 
-        proxyRes.on("end", function () {
+        stream.on("end", function () {
           if (buffer.trim()) {
             var lines = buffer.split("\n");
             var patchedLines = [];
@@ -468,39 +552,43 @@ function handleProxyRequest(req, res, bodyBuf) {
         });
       } else {
         var bodyChunks = [];
-        proxyRes.on("data", function (chunk) {
+        stream.on("data", function (chunk) {
           bodyChunks.push(chunk);
         });
-        proxyRes.on("end", function () {
+        stream.on("end", function () {
           var bodyStr = Buffer.concat(bodyChunks).toString("utf8");
           var patched = patchNonStreamingBody(bodyStr, toolLookup, messages, toolChoice);
-          var outHeaders = Object.assign({}, proxyRes.headers);
+          var outHeaders = {};
+          for (var k in headers) {
+            if (
+              k !== http2.constants.HTTP2_HEADER_STATUS &&
+              Object.prototype.hasOwnProperty.call(headers, k)
+            ) {
+              outHeaders[k] = headers[k];
+            }
+          }
           outHeaders["content-length"] = Buffer.byteLength(patched);
           delete outHeaders["transfer-encoding"];
-          res.writeHead(proxyRes.statusCode, outHeaders);
+          res.writeHead(status, outHeaders);
           res.end(patched);
         });
       }
-    }
-  );
+    });
 
-  proxyReq.on("timeout", function () {
-    console.error("[ERROR] upstream timeout (" + UPSTREAM_TIMEOUT / 1000 + "s)");
-    proxyReq.destroy(new Error("upstream timeout"));
+    stream.on("error", function (err) {
+      clearTimeout(timeoutId);
+      console.error("[ERROR] h2 stream error: " + err.message);
+      if (!res.headersSent) {
+        res.writeHead(502, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "Bad Gateway", message: err.message }));
+      } else {
+        res.end();
+      }
+    });
+
+    stream.write(bodyBuf);
+    stream.end();
   });
-
-  proxyReq.on("error", function (err) {
-    console.error("[ERROR] proxy request failed: " + err.message);
-    if (!res.headersSent) {
-      res.writeHead(502, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: "Bad Gateway", message: err.message }));
-    } else {
-      res.end();
-    }
-  });
-
-  proxyReq.write(bodyBuf);
-  proxyReq.end();
 }
 
 var server = http.createServer(function (req, res) {
@@ -534,7 +622,7 @@ var server = http.createServer(function (req, res) {
 
 server.listen(PORT, BIND_ADDRESS, function () {
   console.error("[nvidia-glm-proxy] Listening on http://" + BIND_ADDRESS + ":" + PORT);
-  console.error("[nvidia-glm-proxy] Proxying to https://" + TARGET_HOST);
+  console.error("[nvidia-glm-proxy] Proxying to https://" + TARGET_HOST + " (HTTP/2)");
   console.error(
     "[nvidia-glm-proxy] Patches: numeric id, missing id, missing function.name (with inference), id stabilization"
   );
