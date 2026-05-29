@@ -2,6 +2,9 @@
 
 $ErrorActionPreference = "Stop"
 
+$ScriptDir = if ($PSScriptRoot) { $PSScriptRoot } elseif ($MyInvocation.MyCommand.Path) { Split-Path -Parent $MyInvocation.MyCommand.Path } else { $PWD.Path }
+Set-Location $ScriptDir
+
 Write-Host ""
 Write-Host "=== nvidia-glm-proxy uninstaller ===" -ForegroundColor Cyan
 Write-Host ""
