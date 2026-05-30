@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.2.0] - 2026-05-30
+
+### Fixed
+
+- **Critical: `patchToolCalls()` typo broke all streaming tool_call patches**: `var tc = obj[j]` → `var tc = obj.tool_calls[j]`. This single-character bug meant the proxy never actually patched tool_call `id` or `function.name` in streaming responses, causing `AI_InvalidResponseDataError: Expected 'id' to be a string` in Vercel AI SDK clients like opencode.
+- Streaming tool_calls from GLM-5.1 now correctly receive injected `id` (UUID format) and inferred `function.name` when missing.
+
 ## [1.1.0] - 2025-05-30
 
 ### Added

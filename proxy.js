@@ -244,7 +244,7 @@ function patchToolCalls(obj, toolCallIdMap, toolLookup, messages, toolChoice) {
   }
   if (obj.tool_calls && Array.isArray(obj.tool_calls)) {
     for (var j = 0; j < obj.tool_calls.length; j++) {
-      var tc = obj[j];
+      var tc = obj.tool_calls[j];
       if (!tc) continue;
       if (tc.id == null || typeof tc.id === "undefined") {
         var newId = generateCallId();
