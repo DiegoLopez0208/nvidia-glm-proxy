@@ -234,11 +234,11 @@ function inferFunctionName(argumentsStr, toolLookup, messages, toolChoice) {
   return null;
 }
 
-function patchToolCalls(obj, toolCallIdMap, toolLookup, messages, toolChoice) {
+function patchToolCalls(obj, toolCallIdMap, toolCallNameMap, toolLookup, messages, toolChoice) {
   if (!obj || typeof obj !== "object") return obj;
   if (Array.isArray(obj)) {
     for (var i = 0; i < obj.length; i++) {
-      obj[i] = patchToolCalls(obj[i], toolCallIdMap, toolLookup, messages, toolChoice);
+      obj[i] = patchToolCalls(obj[i], toolCallIdMap, toolCallNameMap, toolLookup, messages, toolChoice);
     }
     return obj;
   }
@@ -255,56 +255,68 @@ function patchToolCalls(obj, toolCallIdMap, toolLookup, messages, toolChoice) {
         console.error("[PATCH] numeric id " + tc.id + " -> " + replacement);
         tc.id = replacement;
       }
-      if (tc.function && typeof tc.function === "object") {
-        if (tc.function.name == null || typeof tc.function.name === "undefined") {
-          var inferred = inferFunctionName(
-            tc.function.arguments,
-            toolLookup,
-            messages,
-            toolChoice
-          );
-          if (inferred) {
-            console.error("[INFER] missing function.name -> " + inferred);
-            tc.function.name = inferred;
-          } else {
-            console.error('[PATCH] missing function.name -> "unknown" (could not infer)');
-            tc.function.name = "unknown";
-          }
-        } else if (typeof tc.function.name === "number") {
+        if (tc.function && typeof tc.function === "object") {
+          if (tc.function.name == null || typeof tc.function.name === "undefined") {
+            var knownName = toolCallNameMap && tc.index != null && toolCallNameMap.has(tc.index)
+              ? toolCallNameMap.get(tc.index) : null;
+            if (knownName) {
+              tc.function.name = knownName;
+            } else {
+              var inferred = inferFunctionName(
+                tc.function.arguments,
+                toolLookup,
+                messages,
+                toolChoice
+              );
+              if (inferred) {
+                console.error("[INFER] missing function.name -> " + inferred);
+                tc.function.name = inferred;
+              } else {
+                console.error('[PATCH] missing function.name -> "unknown" (could not infer)');
+                tc.function.name = "unknown";
+              }
+            }
+          } else if (typeof tc.function.name === "number") {
           var nameStr = String(tc.function.name);
-          console.error("[PATCH] numeric function.name " + tc.function.name + " -> " + nameStr);
-          tc.function.name = nameStr;
-        }
+            console.error("[PATCH] numeric function.name " + tc.function.name + " -> " + nameStr);
+            tc.function.name = nameStr;
+          }
+          if (toolCallNameMap && tc.index != null && typeof tc.function.name === "string" && tc.function.name.length > 0 && tc.function.name !== "unknown") {
+            toolCallNameMap.set(tc.index, tc.function.name);
+          }
       }
       if (toolCallIdMap && tc.index != null) {
         var idx = tc.index;
+        var tcIdStr = typeof tc.id === "string" ? tc.id : "";
         if (toolCallIdMap.has(idx)) {
           var stableId = toolCallIdMap.get(idx);
-          if (tc.id !== stableId) {
+          if (tcIdStr && tcIdStr !== stableId) {
             console.error(
               "[PATCH] stabilized id for index " + idx + ": " + tc.id + " -> " + stableId
             );
             tc.id = stableId;
+          } else if (!tcIdStr) {
+            tc.id = stableId;
           }
-        } else if (typeof tc.id === "string" && tc.id.length > 0) {
-          toolCallIdMap.set(idx, tc.id);
+        } else if (tcIdStr.length > 0) {
+          toolCallIdMap.set(idx, tcIdStr);
         }
       }
     }
   }
   for (var key in obj) {
     if (key !== "tool_calls" && Object.prototype.hasOwnProperty.call(obj, key)) {
-      obj[key] = patchToolCalls(obj[key], toolCallIdMap, toolLookup, messages, toolChoice);
+      obj[key] = patchToolCalls(obj[key], toolCallIdMap, toolCallNameMap, toolLookup, messages, toolChoice);
     }
   }
   return obj;
 }
 
-function patchSseData(dataStr, toolCallIdMap, toolLookup, messages, toolChoice) {
+function patchSseData(dataStr, toolCallIdMap, toolCallNameMap, toolLookup, messages, toolChoice) {
   if (!dataStr || dataStr.trim() === "[DONE]") return dataStr;
   try {
     var parsed = JSON.parse(dataStr);
-    patchToolCalls(parsed, toolCallIdMap, toolLookup, messages, toolChoice);
+    patchToolCalls(parsed, toolCallIdMap, toolCallNameMap, toolLookup, messages, toolChoice);
     return JSON.stringify(parsed);
   } catch (e) {
     var patched = dataStr.replace(NUMERIC_ID_RE, function (match, key, num) {
@@ -319,7 +331,7 @@ function patchSseData(dataStr, toolCallIdMap, toolLookup, messages, toolChoice) 
 function patchNonStreamingBody(bodyStr, toolLookup, messages, toolChoice) {
   try {
     var parsed = JSON.parse(bodyStr);
-    patchToolCalls(parsed, null, toolLookup, messages, toolChoice);
+    patchToolCalls(parsed, null, null, toolLookup, messages, toolChoice);
     return JSON.stringify(parsed);
   } catch (e) {
     return bodyStr;
@@ -518,23 +530,24 @@ function handleProxyRequest(req, res, bodyBuf) {
         };
         res.writeHead(status, outHeaders);
         var buffer = "";
-        var toolCallIdMap = new Map();
-        stream.on("data", function (chunk) {
-          buffer += chunk.toString("utf8");
-          var parts = buffer.split("\n\n");
-          buffer = parts.pop();
-          for (var i = 0; i < parts.length; i++) {
-            var eventBlock = parts[i];
-            if (!eventBlock) continue;
-            var lines = eventBlock.split("\n");
-            var patchedLines = [];
-            for (var j = 0; j < lines.length; j++) {
-              var line = lines[j];
-              if (line.indexOf("data: ") === 0) {
-                var dataPayload = line.slice(6);
-                patchedLines.push(
-                  "data: " + patchSseData(dataPayload, toolCallIdMap, toolLookup, messages, toolChoice)
-                );
+      var toolCallIdMap = new Map();
+      var toolCallNameMap = new Map();
+      stream.on("data", function (chunk) {
+        buffer += chunk.toString("utf8");
+        var parts = buffer.split("\n\n");
+        buffer = parts.pop();
+        for (var i = 0; i < parts.length; i++) {
+          var eventBlock = parts[i];
+          if (!eventBlock) continue;
+          var lines = eventBlock.split("\n");
+          var patchedLines = [];
+          for (var j = 0; j < lines.length; j++) {
+            var line = lines[j];
+            if (line.indexOf("data: ") === 0) {
+              var dataPayload = line.slice(6);
+              patchedLines.push(
+                "data: " + patchSseData(dataPayload, toolCallIdMap, toolCallNameMap, toolLookup, messages, toolChoice)
+              );
               } else {
                 patchedLines.push(line);
               }
@@ -551,7 +564,7 @@ function handleProxyRequest(req, res, bodyBuf) {
               if (line.indexOf("data: ") === 0) {
                 var dataPayload = line.slice(6);
                 patchedLines.push(
-                  "data: " + patchSseData(dataPayload, toolCallIdMap, toolLookup, messages, toolChoice)
+                  "data: " + patchSseData(dataPayload, toolCallIdMap, toolCallNameMap, toolLookup, messages, toolChoice)
                 );
               } else {
                 patchedLines.push(line);
