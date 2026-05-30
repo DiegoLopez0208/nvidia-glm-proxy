@@ -2,6 +2,22 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.1.0] - 2025-05-30
+
+### Added
+
+- **Vision model auto-routing**: When a request contains `image_url` in any message's content array, the proxy automatically rewrites `model` to `VISION_MODEL` (default: `meta/llama-3.2-90b-vision-instruct`). This enables vision capabilities for MCP tools like `analyze_screenshot` without any client-side changes.
+- **`VISION_MODEL` env var**: Configure the vision model to route to. Defaults to `meta/llama-3.2-90b-vision-instruct`.
+- **`detectVisionRequest()`**: Scans message content arrays for `type: "image_url"` entries.
+- **Health endpoint now shows `visionModel`**: `/health` returns the configured vision model name.
+- **Startup log shows vision model**: `[nvidia-glm-proxy] Vision model: meta/llama-3.2-90b-vision-instruct (auto-route on image_url)`
+
+### Changed
+
+- **`UPSTREAM_TIMEOUT` default**: 120s → 180s. Vision model inference with images takes longer than text-only.
+- **`.env` line ending handling**: `loadEnv()` now splits on `\r?\n` (Windows CRLF compatible).
+- **`.env` BOM handling**: `loadEnv()` strips UTF-8 BOM (`\uFEFF`) from `.env` files created by Windows Notepad.
+
 ## [1.0.3] - 2025-05-29
 
 ### Fixed

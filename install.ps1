@@ -45,8 +45,9 @@ NVIDIA_API_KEY=nvapi-your-key-here
 NVIDIA_NIM_HOST=integrate.api.nvidia.com
 NVIDIA_NIM_PORT=443
 PROXY_PORT=9999
-UPSTREAM_TIMEOUT=120000
+UPSTREAM_TIMEOUT=180000
 BIND_ADDRESS=127.0.0.1
+VISION_MODEL=meta/llama-3.2-90b-vision-instruct
 "@ | Set-Content $envFile -Encoding UTF8
         Write-Host "Created .env with defaults." -ForegroundColor Yellow
         Write-Host "IMPORTANT: Edit $envFile and set your NVIDIA_API_KEY" -ForegroundColor Red

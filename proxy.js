@@ -11,7 +11,8 @@ function loadEnv() {
   var envPath = path.resolve(__dirname, ".env");
   if (!fs.existsSync(envPath)) return;
   var content = fs.readFileSync(envPath, "utf8");
-  var lines = content.split("\n");
+  if (content.charCodeAt(0) === 0xFEFF) content = content.slice(1);
+  var lines = content.split(/\r?\n/);
   for (var i = 0; i < lines.length; i++) {
     var line = lines[i].trim();
     if (!line || line[0] === "#") continue;
@@ -24,15 +25,15 @@ function loadEnv() {
     if (!process.env[key]) process.env[key] = val;
   }
 }
-
 loadEnv();
 
 var PORT = parseInt(process.env.PROXY_PORT, 10) || 9999;
 var TARGET_HOST = process.env.NVIDIA_NIM_HOST || "integrate.api.nvidia.com";
 var TARGET_PORT = parseInt(process.env.NVIDIA_NIM_PORT, 10) || 443;
-var UPSTREAM_TIMEOUT = parseInt(process.env.UPSTREAM_TIMEOUT, 10) || 120000;
+var UPSTREAM_TIMEOUT = parseInt(process.env.UPSTREAM_TIMEOUT, 10) || 180000;
 var DEFAULT_API_KEY = process.env.NVIDIA_API_KEY || "";
 var BIND_ADDRESS = process.env.BIND_ADDRESS || "127.0.0.1";
+var VISION_MODEL = process.env.VISION_MODEL || "meta/llama-3.2-90b-vision-instruct";
 
 var NUMERIC_ID_RE = /("id")\s*:\s*(\d+)/g;
 
@@ -114,7 +115,6 @@ function inferFunctionName(argumentsStr, toolLookup, messages, toolChoice) {
         return forced;
       }
     }
-
     var lastUserMsg = getLastUserMessage(messages).toLowerCase();
     if (lastUserMsg) {
       for (var i = 0; i < toolLookup.noParamTools.length; i++) {
@@ -125,24 +125,18 @@ function inferFunctionName(argumentsStr, toolLookup, messages, toolChoice) {
           return npName;
         }
       }
-
       var bestTool = null;
       var bestScore = 0;
       var userWords = lastUserMsg
         .replace(/[^\w\s]/g, " ")
         .split(/\s+/)
-        .filter(function (w) {
-          return w.length > 2;
-        });
-
+        .filter(function (w) { return w.length > 2; });
       for (var i = 0; i < toolLookup.noParamTools.length; i++) {
         var t = toolLookup.noParamTools[i];
         var descWords = t.description
           .replace(/[^\w\s]/g, " ")
           .split(/\s+/)
-          .filter(function (w) {
-            return w.length > 2;
-          });
+          .filter(function (w) { return w.length > 2; });
         var score = 0;
         for (var u = 0; u < userWords.length; u++) {
           for (var d = 0; d < descWords.length; d++) {
@@ -177,7 +171,6 @@ function inferFunctionName(argumentsStr, toolLookup, messages, toolChoice) {
         return bestTool;
       }
     }
-
     if (toolLookup.noParamTools.length === 1) {
       console.error("[INFER] only no-param tool -> " + toolLookup.noParamTools[0].name);
       return toolLookup.noParamTools[0].name;
@@ -251,7 +244,7 @@ function patchToolCalls(obj, toolCallIdMap, toolLookup, messages, toolChoice) {
   }
   if (obj.tool_calls && Array.isArray(obj.tool_calls)) {
     for (var j = 0; j < obj.tool_calls.length; j++) {
-      var tc = obj.tool_calls[j];
+      var tc = obj[j];
       if (!tc) continue;
       if (tc.id == null || typeof tc.id === "undefined") {
         var newId = generateCallId();
@@ -333,16 +326,32 @@ function patchNonStreamingBody(bodyStr, toolLookup, messages, toolChoice) {
   }
 }
 
+function detectVisionRequest(messages) {
+  if (!messages || !Array.isArray(messages)) return false;
+  for (var i = 0; i < messages.length; i++) {
+    var content = messages[i].content;
+    if (Array.isArray(content)) {
+      for (var j = 0; j < content.length; j++) {
+        if (content[j] && content[j].type === "image_url") return true;
+      }
+    }
+  }
+  return false;
+}
+
 function extractRequestContext(bodyBuf) {
   try {
     var parsed = JSON.parse(bodyBuf.toString("utf8"));
+    var messages = Array.isArray(parsed.messages) ? parsed.messages : [];
     return {
       tools: Array.isArray(parsed.tools) ? parsed.tools : [],
-      messages: Array.isArray(parsed.messages) ? parsed.messages : [],
+      messages: messages,
       toolChoice: parsed.tool_choice || null,
+      isVisionRequest: detectVisionRequest(messages),
+      model: parsed.model || null,
     };
   } catch (e) {
-    return { tools: [], messages: [], toolChoice: null };
+    return { tools: [], messages: [], toolChoice: null, isVisionRequest: false, model: null };
   }
 }
 
@@ -356,7 +365,6 @@ function buildProxyHeaders(incomingHeaders) {
     out[key] = incomingHeaders[key];
   }
   out["host"] = TARGET_HOST;
-
   if (DEFAULT_API_KEY) {
     var authKey = null;
     for (var k in out) {
@@ -377,7 +385,6 @@ function buildProxyHeaders(incomingHeaders) {
       console.error("[AUTH] injected default API key from env");
     }
   }
-
   return out;
 }
 
@@ -390,6 +397,7 @@ function handleHealthCheck(req, res) {
       version: require("./package.json").version,
       upstream: TARGET_HOST + ":" + TARGET_PORT,
       port: PORT,
+      visionModel: VISION_MODEL,
     })
   );
 }
@@ -444,6 +452,17 @@ function handleProxyRequest(req, res, bodyBuf) {
   var messages = ctx.messages;
   var toolChoice = ctx.toolChoice;
 
+  if (ctx.isVisionRequest) {
+    try {
+      var bodyObj = JSON.parse(bodyBuf.toString("utf8"));
+      bodyObj.model = VISION_MODEL;
+      bodyBuf = Buffer.from(JSON.stringify(bodyObj), "utf8");
+      console.error("[VISION] detected image_url -> routing to " + VISION_MODEL);
+    } catch (e) {
+      console.error("[VISION] failed to rewrite model: " + e.message);
+    }
+  }
+
   var proxyHeaders = buildProxyHeaders(req.headers);
   delete proxyHeaders["connection"];
   delete proxyHeaders["transfer-encoding"];
@@ -462,7 +481,6 @@ function handleProxyRequest(req, res, bodyBuf) {
   }, UPSTREAM_TIMEOUT);
 
   var stream = null;
-
   getH2Session(function (err, session) {
     if (err || !session) {
       clearTimeout(timeoutId);
@@ -473,7 +491,6 @@ function handleProxyRequest(req, res, bodyBuf) {
       }
       return;
     }
-
     try {
       stream = session.request(proxyHeaders);
     } catch (e) {
@@ -486,7 +503,6 @@ function handleProxyRequest(req, res, bodyBuf) {
       }
       return;
     }
-
     stream.on("response", function (headers) {
       clearTimeout(timeoutId);
       var status = headers[http2.constants.HTTP2_HEADER_STATUS] || 200;
@@ -501,10 +517,8 @@ function handleProxyRequest(req, res, bodyBuf) {
           "x-accel-buffering": "no",
         };
         res.writeHead(status, outHeaders);
-
         var buffer = "";
         var toolCallIdMap = new Map();
-
         stream.on("data", function (chunk) {
           buffer += chunk.toString("utf8");
           var parts = buffer.split("\n\n");
@@ -519,8 +533,7 @@ function handleProxyRequest(req, res, bodyBuf) {
               if (line.indexOf("data: ") === 0) {
                 var dataPayload = line.slice(6);
                 patchedLines.push(
-                  "data: " +
-                    patchSseData(dataPayload, toolCallIdMap, toolLookup, messages, toolChoice)
+                  "data: " + patchSseData(dataPayload, toolCallIdMap, toolLookup, messages, toolChoice)
                 );
               } else {
                 patchedLines.push(line);
@@ -529,7 +542,6 @@ function handleProxyRequest(req, res, bodyBuf) {
             res.write(patchedLines.join("\n") + "\n\n");
           }
         });
-
         stream.on("end", function () {
           if (buffer.trim()) {
             var lines = buffer.split("\n");
@@ -539,8 +551,7 @@ function handleProxyRequest(req, res, bodyBuf) {
               if (line.indexOf("data: ") === 0) {
                 var dataPayload = line.slice(6);
                 patchedLines.push(
-                  "data: " +
-                    patchSseData(dataPayload, toolCallIdMap, toolLookup, messages, toolChoice)
+                  "data: " + patchSseData(dataPayload, toolCallIdMap, toolLookup, messages, toolChoice)
                 );
               } else {
                 patchedLines.push(line);
@@ -574,7 +585,6 @@ function handleProxyRequest(req, res, bodyBuf) {
         });
       }
     });
-
     stream.on("error", function (err) {
       clearTimeout(timeoutId);
       console.error("[ERROR] h2 stream error: " + err.message);
@@ -585,7 +595,6 @@ function handleProxyRequest(req, res, bodyBuf) {
         res.end();
       }
     });
-
     stream.write(bodyBuf);
     stream.end();
   });
@@ -596,13 +605,11 @@ var server = http.createServer(function (req, res) {
     handleHealthCheck(req, res);
     return;
   }
-
   if (req.url.indexOf("/v1") !== 0) {
     res.writeHead(404, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ error: "Not Found", path: req.url }));
     return;
   }
-
   var bodyChunks = [];
   req.on("data", function (chunk) {
     bodyChunks.push(chunk);
@@ -627,6 +634,7 @@ server.listen(PORT, BIND_ADDRESS, function () {
     "[nvidia-glm-proxy] Patches: numeric id, missing id, missing function.name (with inference), id stabilization"
   );
   console.error("[nvidia-glm-proxy] Upstream timeout: " + UPSTREAM_TIMEOUT / 1000 + "s");
+  console.error("[nvidia-glm-proxy] Vision model: " + VISION_MODEL + " (auto-route on image_url)");
   if (DEFAULT_API_KEY) {
     console.error("[nvidia-glm-proxy] Default API key: loaded from env");
   } else {
