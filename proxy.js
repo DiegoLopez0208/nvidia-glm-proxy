@@ -234,6 +234,36 @@ function inferFunctionName(argumentsStr, toolLookup, messages, toolChoice) {
   return null;
 }
 
+var MAX_TOOL_CALLS_PER_RESPONSE = 10;
+var MAX_RPM = 10;
+var RETRY_MAX_ATTEMPTS = 3;
+var RETRY_BASE_DELAY = 2000;
+var RETRYABLE_STATUS_CODES = [429, 502, 503, 504];
+var seenToolCallNames = null;
+var requestTimestamps = [];
+
+function resetSeenToolCalls() {
+  seenToolCallNames = {};
+}
+
+function rpmLimiter() {
+  var now = Date.now();
+  requestTimestamps = requestTimestamps.filter(function (ts) { return now - ts < 60000; });
+  if (requestTimestamps.length >= MAX_RPM) {
+    var oldest = requestTimestamps[0];
+    var waitMs = 60000 - (now - oldest) + 100;
+    console.error("[RATE] RPM limit reached (" + requestTimestamps.length + "/" + MAX_RPM + "), waiting " + Math.ceil(waitMs / 1000) + "s");
+    return waitMs;
+  }
+  requestTimestamps.push(now);
+  return 0;
+}
+
+function retryDelay(attempt, retryAfterMs) {
+  if (retryAfterMs && retryAfterMs > 0) return retryAfterMs;
+  return RETRY_BASE_DELAY * Math.pow(2, attempt);
+}
+
 function patchToolCalls(obj, toolCallIdMap, toolCallNameMap, toolLookup, messages, toolChoice) {
   if (!obj || typeof obj !== "object") return obj;
   if (Array.isArray(obj)) {
@@ -243,9 +273,24 @@ function patchToolCalls(obj, toolCallIdMap, toolCallNameMap, toolLookup, message
     return obj;
   }
   if (obj.tool_calls && Array.isArray(obj.tool_calls)) {
+    var filteredCalls = [];
     for (var j = 0; j < obj.tool_calls.length; j++) {
       var tc = obj.tool_calls[j];
       if (!tc) continue;
+      var tcName = (tc.function && typeof tc.function.name === "string") ? tc.function.name : "";
+      var tcArgs = (tc.function && typeof tc.function.arguments === "string") ? tc.function.arguments : "{}";
+      var tcKey = tcName + "|" + tcArgs;
+      if (!seenToolCallNames) resetSeenToolCalls();
+      if (seenToolCallNames[tcKey]) {
+        console.error("[DEDUP] removing duplicate tool_call: " + tcName + " (already seen in this response)");
+        continue;
+      }
+      var totalSeen = Object.keys(seenToolCallNames).length;
+      if (totalSeen >= MAX_TOOL_CALLS_PER_RESPONSE) {
+        console.error("[LIMIT] dropping tool_call: " + tcName + " (max " + MAX_TOOL_CALLS_PER_RESPONSE + " per response reached)");
+        continue;
+      }
+      seenToolCallNames[tcKey] = true;
       if (tc.id == null || typeof tc.id === "undefined") {
         var newId = generateCallId();
         console.error("[PATCH] missing id -> " + newId);
@@ -281,28 +326,36 @@ function patchToolCalls(obj, toolCallIdMap, toolCallNameMap, toolLookup, message
             console.error("[PATCH] numeric function.name " + tc.function.name + " -> " + nameStr);
             tc.function.name = nameStr;
           }
-          if (toolCallNameMap && tc.index != null && typeof tc.function.name === "string" && tc.function.name.length > 0 && tc.function.name !== "unknown") {
-            toolCallNameMap.set(tc.index, tc.function.name);
-          }
+      if (toolCallNameMap && tc.index != null && typeof tc.function.name === "string" && tc.function.name.length > 0 && tc.function.name !== "unknown") {
+        toolCallNameMap.set(tc.index, tc.function.name);
       }
+    }
       if (toolCallIdMap && tc.index != null) {
         var idx = tc.index;
         var tcIdStr = typeof tc.id === "string" ? tc.id : "";
+        var isGeneratedId = tcIdStr.indexOf("call_") === 0;
         if (toolCallIdMap.has(idx)) {
           var stableId = toolCallIdMap.get(idx);
-          if (tcIdStr && tcIdStr !== stableId) {
+          if (isGeneratedId && stableId.indexOf("call_") !== 0) {
             console.error(
               "[PATCH] stabilized id for index " + idx + ": " + tc.id + " -> " + stableId
             );
             tc.id = stableId;
           } else if (!tcIdStr) {
             tc.id = stableId;
+          } else if (tcIdStr.indexOf("chatcmpl-") === 0 || tcIdStr.indexOf("call_") !== 0) {
+            toolCallIdMap.set(idx, tcIdStr);
           }
         } else if (tcIdStr.length > 0) {
           toolCallIdMap.set(idx, tcIdStr);
         }
       }
-    }
+    filteredCalls.push(tc);
+  }
+  if (obj.tool_calls.length !== filteredCalls.length) {
+    console.error("[DEDUP] tool_calls reduced from " + obj.tool_calls.length + " to " + filteredCalls.length);
+  }
+  obj.tool_calls = filteredCalls;
   }
   for (var key in obj) {
     if (key !== "tool_calls" && Object.prototype.hasOwnProperty.call(obj, key)) {
@@ -459,6 +512,7 @@ function getH2Session(cb) {
 }
 
 function handleProxyRequest(req, res, bodyBuf) {
+  resetSeenToolCalls();
   var ctx = extractRequestContext(bodyBuf);
   var toolLookup = buildToolLookup(ctx.tools);
   var messages = ctx.messages;
@@ -475,6 +529,15 @@ function handleProxyRequest(req, res, bodyBuf) {
     }
   }
 
+  var waitMs = rpmLimiter();
+  if (waitMs > 0) {
+    setTimeout(function () { doProxyAttempt(req, res, bodyBuf, toolLookup, messages, toolChoice, 0); }, waitMs);
+  } else {
+    doProxyAttempt(req, res, bodyBuf, toolLookup, messages, toolChoice, 0);
+  }
+}
+
+function doProxyAttempt(req, res, bodyBuf, toolLookup, messages, toolChoice, attempt) {
   var proxyHeaders = buildProxyHeaders(req.headers);
   delete proxyHeaders["connection"];
   delete proxyHeaders["transfer-encoding"];
@@ -516,8 +579,28 @@ function handleProxyRequest(req, res, bodyBuf) {
       return;
     }
     stream.on("response", function (headers) {
-      clearTimeout(timeoutId);
       var status = headers[http2.constants.HTTP2_HEADER_STATUS] || 200;
+
+      if (RETRYABLE_STATUS_CODES.indexOf(status) !== -1 && attempt < RETRY_MAX_ATTEMPTS) {
+        clearTimeout(timeoutId);
+        stream.resume();
+        stream.on("end", function () {
+          var retryAfterHeader = headers["retry-after"];
+          var retryAfterMs = null;
+          if (retryAfterHeader) {
+            var parsed = parseInt(retryAfterHeader, 10);
+            if (!isNaN(parsed)) retryAfterMs = parsed > 100 ? parsed : parsed * 1000;
+          }
+          var delay = retryDelay(attempt, retryAfterMs);
+          console.error("[RETRY] status " + status + ", attempt " + (attempt + 1) + "/" + RETRY_MAX_ATTEMPTS + ", retrying in " + (delay / 1000) + "s");
+          setTimeout(function () {
+            doProxyAttempt(req, res, bodyBuf, toolLookup, messages, toolChoice, attempt + 1);
+          }, delay);
+        });
+        return;
+      }
+
+      clearTimeout(timeoutId);
       var contentType = (headers["content-type"] || "").toLowerCase();
       var isStreaming = contentType.indexOf("text/event-stream") !== -1;
 
@@ -644,10 +727,13 @@ server.listen(PORT, BIND_ADDRESS, function () {
   console.error("[nvidia-glm-proxy] Listening on http://" + BIND_ADDRESS + ":" + PORT);
   console.error("[nvidia-glm-proxy] Proxying to https://" + TARGET_HOST + " (HTTP/2)");
   console.error(
-    "[nvidia-glm-proxy] Patches: numeric id, missing id, missing function.name (with inference), id stabilization"
+    "[nvidia-glm-proxy] Patches: numeric id, missing id, missing function.name (with inference), id stabilization, retry/backoff, rpm limiter"
   );
   console.error("[nvidia-glm-proxy] Upstream timeout: " + UPSTREAM_TIMEOUT / 1000 + "s");
   console.error("[nvidia-glm-proxy] Vision model: " + VISION_MODEL + " (auto-route on image_url)");
+  console.error("[nvidia-glm-proxy] Max tool calls per response: " + MAX_TOOL_CALLS_PER_RESPONSE);
+  console.error("[nvidia-glm-proxy] Rate limit: " + MAX_RPM + " RPM");
+  console.error("[nvidia-glm-proxy] Retry: " + RETRY_MAX_ATTEMPTS + " attempts, backoff " + RETRY_BASE_DELAY + "ms base");
   if (DEFAULT_API_KEY) {
     console.error("[nvidia-glm-proxy] Default API key: loaded from env");
   } else {
