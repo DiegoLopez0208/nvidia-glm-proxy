@@ -235,15 +235,42 @@ function inferFunctionName(argumentsStr, toolLookup, messages, toolChoice) {
 }
 
 var MAX_TOOL_CALLS_PER_RESPONSE = 10;
+var MAX_SAME_TOOL_CALL = 3;
+var MAX_TOTAL_TOOL_CALLS = 30;
 var MAX_RPM = 10;
 var RETRY_MAX_ATTEMPTS = 3;
 var RETRY_BASE_DELAY = 2000;
 var RETRYABLE_STATUS_CODES = [429, 502, 503, 504];
 var seenToolCallNames = null;
+var globalToolCallCounts = {};
 var requestTimestamps = [];
 
 function resetSeenToolCalls() {
   seenToolCallNames = {};
+}
+
+function checkToolCallLoop(tcName) {
+  if (!globalToolCallCounts) globalToolCallCounts = {};
+  globalToolCallCounts[tcName] = (globalToolCallCounts[tcName] || 0) + 1;
+  var totalCalls = 0;
+  for (var k in globalToolCallCounts) {
+    if (Object.prototype.hasOwnProperty.call(globalToolCallCounts, k)) {
+      totalCalls += globalToolCallCounts[k];
+    }
+  }
+  if (globalToolCallCounts[tcName] > MAX_SAME_TOOL_CALL) {
+    console.error("[LOOP] tool " + tcName + " called " + globalToolCallCounts[tcName] + " times (max " + MAX_SAME_TOOL_CALL + ") - likely loop detected");
+    return true;
+  }
+  if (totalCalls > MAX_TOTAL_TOOL_CALLS) {
+    console.error("[LOOP] total tool calls " + totalCalls + " exceeds max " + MAX_TOTAL_TOOL_CALLS + " - stopping");
+    return true;
+  }
+  return false;
+}
+
+function resetGlobalToolCounts() {
+  globalToolCallCounts = {};
 }
 
 function rpmLimiter() {
@@ -291,6 +318,10 @@ function patchToolCalls(obj, toolCallIdMap, toolCallNameMap, toolLookup, message
         continue;
       }
       seenToolCallNames[tcKey] = true;
+      if (tcName && tcName !== "unknown" && checkToolCallLoop(tcName)) {
+        console.error("[LOOP] dropping tool_call: " + tcName + " (loop detected, called " + (globalToolCallCounts[tcName] || 0) + " times)");
+        continue;
+      }
       if (tc.id == null || typeof tc.id === "undefined") {
         var newId = generateCallId();
         console.error("[PATCH] missing id -> " + newId);
@@ -513,10 +544,14 @@ function getH2Session(cb) {
 
 function handleProxyRequest(req, res, bodyBuf) {
   resetSeenToolCalls();
+  resetGlobalToolCounts();
   var ctx = extractRequestContext(bodyBuf);
   var toolLookup = buildToolLookup(ctx.tools);
   var messages = ctx.messages;
   var toolChoice = ctx.toolChoice;
+  var requestModel = ctx.model || "";
+  var isGlmModel = requestModel.indexOf("glm") !== -1;
+  var maxAttempts = isGlmModel ? 2 : RETRY_MAX_ATTEMPTS;
 
   if (ctx.isVisionRequest) {
     try {
@@ -531,13 +566,13 @@ function handleProxyRequest(req, res, bodyBuf) {
 
   var waitMs = rpmLimiter();
   if (waitMs > 0) {
-    setTimeout(function () { doProxyAttempt(req, res, bodyBuf, toolLookup, messages, toolChoice, 0); }, waitMs);
+    setTimeout(function () { doProxyAttempt(req, res, bodyBuf, toolLookup, messages, toolChoice, 0, maxAttempts); }, waitMs);
   } else {
-    doProxyAttempt(req, res, bodyBuf, toolLookup, messages, toolChoice, 0);
+    doProxyAttempt(req, res, bodyBuf, toolLookup, messages, toolChoice, 0, maxAttempts);
   }
 }
 
-function doProxyAttempt(req, res, bodyBuf, toolLookup, messages, toolChoice, attempt) {
+function doProxyAttempt(req, res, bodyBuf, toolLookup, messages, toolChoice, attempt, maxAttempts) {
   var proxyHeaders = buildProxyHeaders(req.headers);
   delete proxyHeaders["connection"];
   delete proxyHeaders["transfer-encoding"];
@@ -581,7 +616,7 @@ function doProxyAttempt(req, res, bodyBuf, toolLookup, messages, toolChoice, att
     stream.on("response", function (headers) {
       var status = headers[http2.constants.HTTP2_HEADER_STATUS] || 200;
 
-      if (RETRYABLE_STATUS_CODES.indexOf(status) !== -1 && attempt < RETRY_MAX_ATTEMPTS) {
+      if (RETRYABLE_STATUS_CODES.indexOf(status) !== -1 && attempt < (maxAttempts || RETRY_MAX_ATTEMPTS)) {
         clearTimeout(timeoutId);
         stream.resume();
         stream.on("end", function () {
@@ -592,9 +627,9 @@ function doProxyAttempt(req, res, bodyBuf, toolLookup, messages, toolChoice, att
             if (!isNaN(parsed)) retryAfterMs = parsed > 100 ? parsed : parsed * 1000;
           }
           var delay = retryDelay(attempt, retryAfterMs);
-          console.error("[RETRY] status " + status + ", attempt " + (attempt + 1) + "/" + RETRY_MAX_ATTEMPTS + ", retrying in " + (delay / 1000) + "s");
-          setTimeout(function () {
-            doProxyAttempt(req, res, bodyBuf, toolLookup, messages, toolChoice, attempt + 1);
+  console.error("[RETRY] status " + status + ", attempt " + (attempt + 1) + "/" + (maxAttempts || RETRY_MAX_ATTEMPTS) + ", retrying in " + (delay / 1000) + "s");
+  setTimeout(function () {
+    doProxyAttempt(req, res, bodyBuf, toolLookup, messages, toolChoice, attempt + 1, maxAttempts);
           }, delay);
         });
         return;
